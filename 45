@@ -1,0 +1,309 @@
+import logging
+import time
+import hmac
+import hashlib
+import requests
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from telegram import Bot
+from telegram import InputFile
+import json
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.trend import MACD, EMAIndicator
+from ta.volatility import BollingerBands, AverageTrueRange
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import MeanSquaredError
+from sklearn.model_selection import train_test_split
+
+# تنظیمات logging
+logging.basicConfig(
+    filename='trading_bot.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# بارگذاری تنظیمات از فایل config
+def load_config(filename='config.json'):
+    with open(filename, 'r') as f:
+        return json.load(f)
+
+config = load_config()
+
+# اطلاعات API کوینکس و تلگرام
+API_KEY = config['api_key']
+API_SECRET = config['api_secret']
+BASE_URL = 'https://api.coinex.com'
+
+TELEGRAM_TOKEN = config['telegram_token']
+CHAT_ID = config['chat_id']
+BOT = Bot(token=TELEGRAM_TOKEN)
+
+def send_telegram_message(message):
+    try:
+        BOT.send_message(chat_id=CHAT_ID, text=message)
+    except Exception as e:
+        logging.error(f"Error sending message to Telegram: {e}")
+
+def send_telegram_photo(photo_path, caption=""):
+    try:
+        with open(photo_path, 'rb') as photo:
+            BOT.send_photo(chat_id=CHAT_ID, photo=photo, caption=caption)
+    except Exception as e:
+        logging.error(f"Error sending photo to Telegram: {e}")
+
+def sign_request(params):
+    query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params)])
+    return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+
+def api_request(endpoint, params):
+    params['access_id'] = API_KEY
+    params['tonce'] = int(time.time() * 1000)
+    params['signature'] = sign_request(params)
+    
+    retries = 3
+    for attempt in range(retries):
+        try:
+            response = requests.get(f"{BASE_URL}{endpoint}", params=params)
+            response_data = response.json()
+
+            if response.status_code != 200 or ('code' in response_data and response_data['code'] != 0):
+                error_message = f"API Error: {response_data}"
+                logging.error(error_message)
+                send_telegram_message(error_message)
+                return {}
+
+            logging.info(f"API Request Successful: {endpoint}")
+            return response_data
+        except Exception as e:
+            logging.exception(f"API Request Failed: {e}")
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)  # Retry with exponential backoff
+    return {}
+
+def get_candles(market, interval):
+    try:
+        params = {'market': market, 'type': interval, 'limit': 1000}
+        data = api_request('/v1/market/kline', params)
+        if 'data' not in data:
+            error_message = "Failed to fetch candle data."
+            logging.error(error_message)
+            send_telegram_message(error_message)
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'close', 'high', 'low', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+        df[['open', 'close', 'high', 'low', 'volume']] = df[['open', 'close', 'high', 'low', 'volume']].astype(float)
+        logging.info("Candle data fetched successfully.")
+        return df
+    except Exception as e:
+        exception_message = f"Error fetching candles: {e}"
+        logging.exception(exception_message)
+        send_telegram_message(exception_message)
+        return pd.DataFrame()
+
+def calculate_indicators(df):
+    df['RSI'] = RSIIndicator(df['close']).rsi()
+    df['Stoch_K'] = StochasticOscillator(df['high'], df['low'], df['close']).stoch()
+    df['Stoch_D'] = StochasticOscillator(df['high'], df['low'], df['close']).stoch_signal()
+    df['EMA_50'] = EMAIndicator(df['close'], window=50).ema_indicator()
+    df['EMA_200'] = EMAIndicator(df['close'], window=200).ema_indicator()
+    macd = MACD(df['close'])
+    df['MACD'] = macd.macd()
+    df['MACD_Signal'] = macd.macd_signal()
+    bollinger = BollingerBands(df['close'])
+    df['BB_High'] = bollinger.bollinger_hband()
+    df['BB_Low'] = bollinger.bollinger_lband()
+    df['ATR'] = AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
+    df.dropna(inplace=True)
+    return df
+
+def prepare_data(data, feature_cols, target_col, time_step=60):
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    data_scaled = scaler.fit_transform(data[feature_cols])
+    target_scaled = scaler.fit_transform(data[[target_col]])
+
+    X, y = [], []
+    for i in range(time_step, len(data_scaled)):
+        X.append(data_scaled[i-time_step:i])
+        y.append(target_scaled[i])
+    X, y = np.array(X), np.array(y)
+    return X, y, scaler
+
+def create_lstm_model(input_shape, units=64, dropout_rate=0.3):
+    model = Sequential()
+    model.add(LSTM(units=units, return_sequences=True, input_shape=input_shape))
+    model.add(Dropout(dropout_rate))
+    model.add(BatchNormalization())
+    model.add(LSTM(units=units, return_sequences=False))
+    model.add(Dropout(dropout_rate))
+    model.add(Dense(units=1))
+    model.compile(optimizer=Adam(learning_rate=0.001), loss=MeanSquaredError())
+    return model
+
+def evaluate_model(model, X_test, y_test, scaler):
+    predictions = model.predict(X_test)
+    predictions = scaler.inverse_transform(predictions)
+    y_test = scaler.inverse_transform(y_test)
+    mse = MeanSquaredError()(y_test, predictions).numpy()
+    return mse, predictions
+
+def predict_next_price(model, df, scaler, feature_cols, time_step=60):
+    last_data = df[feature_cols].tail(time_step).values
+    last_data_scaled = scaler.transform(last_data)
+    last_data_scaled = np.array([last_data_scaled])
+    next_price_scaled = model.predict(last_data_scaled)
+    next_price = scaler.inverse_transform(next_price_scaled)
+    return next_price[0][0]
+
+def place_order(market, order_type, amount, price):
+    try:
+        params = {
+            'market': market,
+            'type': order_type,
+            'amount': amount,
+            'price': price
+        }
+        response = api_request('/v1/order/limit', params)
+        order_message = f"Order Placed: {order_type} {amount} at {price}"
+        logging.info(order_message)
+        send_telegram_message(order_message)
+        return price
+    except Exception as e:
+        exception_message = f"Order Error: {e}"
+        logging.exception(exception_message)
+        send_telegram_message(exception_message)
+        return None
+
+def send_prediction_to_telegram(price, message):
+    message = f"{message}\nPredicted Price: {price:.2f} USDT"
+    logging.info(message)
+    send_telegram_message(message)
+
+def calculate_profit_loss(entry_price, current_price, position_size):
+    return (current_price - entry_price) * position_size
+
+def send_profit_loss_to_telegram(profit_loss, message):
+    message = f"{message}\nProfit/Loss: {profit_loss:.2f} USDT"
+    logging.info(message)
+    send_telegram_message(message)
+
+def calculate_position_size(total_capital, risk_percentage, entry_price, stop_loss_price):
+    account_risk = total_capital * risk_percentage
+    trade_risk = entry_price - stop_loss_price
+    position_size = account_risk / trade_risk
+    return position_size
+
+def run_bot():
+    market = 'DOGEUSDT'  # بازار معاملاتی مورد نظر
+    buy_levels = [0.1, 0.09, 0.08]  # سطوح خرید
+    sell_levels = [0.12, 0.13, 0.14]  # سطوح فروش
+    total_capital = 10000  # سرمایه کل
+    risk_percentage = 0.01  # درصد ریسک در هر معامله
+    entry_price = None
+    position_size = None
+    stop_loss_price = None
+    take_profit_price = None
+    
+    logging.info(f"Bot Started. Monitoring Market...")
+    send_telegram_message(f"Bot Started. Monitoring Market...")
+    
+    # آموزش مدل ماشین لرنینگ
+    candles = get_candles(market, '5min')
+    candles = calculate_indicators(candles)
+    feature_cols = ['RSI', 'Stoch_K', 'Stoch_D', 'EMA_50', 'EMA_200', 'MACD', 'MACD_Signal', 'BB_High', 'BB_Low', 'ATR']
+    target_col = 'close'
+    X, y, scaler = prepare_data(candles, feature_cols, target_col)
+    
+    # تقسیم داده‌ها به آموزش، اعتبارسنجی و تست
+    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+    
+    # ساخت و آموزش مدل LSTM
+    model = create_lstm_model((X_train.shape[1], X_train.shape[2]))
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    model.fit(X_train, y_train, epochs=100, batch_size=64, validation_data=(X_val, y_val), callbacks=[early_stopping])
+    
+    # ارزیابی مدل
+    mse, predictions = evaluate_model(model, X_test, y_test, scaler)
+    logging.info(f"Model trained. Mean Squared Error: {mse}")
+    
+    while True:
+        candles = get_candles(market, '5min')
+        
+        if candles.empty:
+            logging.warning("No candle data, retrying in 1 minute...")
+            send_telegram_message("No candle data, retrying in 1 minute...")
+            time.sleep(60)
+            continue
+        
+        candles = calculate_indicators(candles)
+        next_price = predict_next_price(model, candles, scaler, feature_cols)
+        
+        send_prediction_to_telegram(next_price, "5-Minute Market Prediction")
+        
+        current_price = candles['close'].iloc[-1]
+        logging.info(f"Current Price: {current_price}")
+
+        balance_data = api_request('/v1/balance/', {})  # دریافت موجودی حساب
+        if balance_data is None or market not in balance_data['data']:
+            logging.warning("Could not fetch balance data.")
+            send_telegram_message("Could not fetch balance data. Waiting...")
+            time.sleep(60)
+            continue
+
+        current_balance = float(balance_data['data'][market]['available'])
+
+        # بررسی و اجرای دستورات خرید
+        for buy_level in buy_levels:
+            if current_price <= buy_level:
+                stop_loss_price = current_price - 2 * candles['ATR'].iloc[-1]  # استفاده از ATR برای حد ضرر
+                take_profit_price = current_price + 2 * candles['ATR'].iloc[-1]  # استفاده از ATR برای حد سود
+                position_size = calculate_position_size(total_capital, risk_percentage, current_price, stop_loss_price)
+
+                if current_balance < position_size:
+                    logging.warning("Insufficient balance for buy order.")
+                    send_telegram_message("Insufficient balance for buy order.")
+                    continue
+
+                entry_price = place_order(market, 'buy', position_size, current_price)
+                break
+
+        # بررسی و اجرای دستورات فروش
+        for sell_level in sell_levels:
+            if current_price >= sell_level and entry_price is not None:
+                place_order(market, 'sell', position_size, current_price)
+                entry_price = None  # Reset entry price after selling
+                break
+
+        # بررسی حد ضرر و حد سود
+        if entry_price is not None:
+            if current_price <= stop_loss_price or current_price >= take_profit_price:
+                place_order(market, 'sell', position_size, current_price)
+                entry_price = None  # Reset entry price after selling
+
+        # محاسبه و اعلان سود و ضرر
+        if entry_price is not None:
+            profit_loss = calculate_profit_loss(entry_price, current_price, position_size)
+            send_profit_loss_to_telegram(profit_loss, "Profit/Loss Update")
+
+        # ذخیره و ارسال گراف قیمت و پیش‌بینی
+        plt.figure(figsize=(10, 5))
+        plt.plot(candles['timestamp'], candles['close'], label='Actual Price')
+        plt.axhline(y=next_price, color='r', linestyle='-', label='Predicted Price')
+        plt.xlabel('Time')
+        plt.ylabel('Price')
+        plt.title('Price Prediction')
+        plt.legend()
+        graph_path = 'price_prediction.png'
+        plt.savefig(graph_path)
+        send_telegram_photo(graph_path, "Price Prediction Graph")
+
+        time.sleep(300)  # انتظار برای 5 دقیقه بعدی
+
+if __name__ == "__main__":
+    run_bot()  # اجرای ربات
